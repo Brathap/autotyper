@@ -20,7 +20,7 @@ except ImportError:
 
 # --- CHECK FOR OPTIONAL PYNPUT LIBRARY ---
 try:
-    from pynput.keyboard import Key, Controller
+    from pynput.keyboard import Key, Controller, Listener
     keyboard = Controller()
     HAS_PYNPUT = True
 except ImportError:
@@ -175,6 +175,26 @@ class AutoTyperApp:
             self.backend_name = "Need wtype/xdotool"
 
         self.stop_event = threading.Event()
+        self.current_subprocess = None
+        self.subprocess_lock = threading.Lock()
+
+        # Global hotkey listener (ESC key) for instant emergency abort
+        self.hotkey_listener = None
+        if HAS_PYNPUT:
+            try:
+                def _on_global_press(key):
+                    if key == Key.esc and not self.stop_event.is_set():
+                        # Immediately abort on ESC
+                        self.stop_process()
+                self.hotkey_listener = Listener(on_press=_on_global_press)
+                self.hotkey_listener.daemon = True
+                self.hotkey_listener.start()
+            except Exception as e:
+                print(f"Hotkey listener error: {e}")
+
+        # Local window binding for ESC key
+        self.root.bind("<Escape>", lambda e: self.stop_process())
+
         self.setup_ui()
         self.set_os(self.selected_os)
 
@@ -263,7 +283,7 @@ class AutoTyperApp:
         if not HAS_SPEECH: self.btn_speak.config(state="disabled", bg="#333")
         self.btn_speak.pack(pady=5)
 
-        self.btn_stop = tk.Button(self.root, text="STOP", bg="#333", fg="#666", font=FONT_BTN, command=self.stop_process, relief="flat", width=BTN_WIDTH, state="disabled")
+        self.btn_stop = tk.Button(self.root, text="⏹ STOP (ESC)", bg="#333", fg="#666", font=FONT_BTN, command=self.stop_process, relief="flat", width=BTN_WIDTH, state="disabled")
         self.btn_stop.pack(pady=5)
 
     # --- OS LOGIC ---
@@ -327,6 +347,15 @@ class AutoTyperApp:
 
     def stop_process(self):
         self.stop_event.set()
+        # Immediately terminate any active typing subprocess (wtype / xdotool)
+        with self.subprocess_lock:
+            if self.current_subprocess and self.current_subprocess.poll() is None:
+                try:
+                    self.current_subprocess.terminate()
+                    self.current_subprocess.kill()
+                except Exception:
+                    pass
+                self.current_subprocess = None
         self.toggle_ui(False)
         self.set_status("STOPPED", THEME["danger"])
 
@@ -503,10 +532,30 @@ class AutoTyperApp:
                     # Standard fast batch / configured speed typing
                     if self.selected_os == "Linux":
                         try:
+                            cmd = None
                             if self.tool == "wtype":
-                                subprocess.run(["wtype", "-d", str(base_delay_ms), "-"], input=content_to_type.encode('utf-8'), check=False)
+                                cmd = ["wtype", "-d", str(base_delay_ms), "-"]
                             elif self.tool == "xdotool":
-                                subprocess.run(["xdotool", "type", "--delay", str(base_delay_ms), "--clearmodifiers", "--file", "-"], input=content_to_type.encode('utf-8'), check=False)
+                                cmd = ["xdotool", "type", "--delay", str(base_delay_ms), "--clearmodifiers", "--file", "-"]
+                            
+                            if cmd:
+                                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                with self.subprocess_lock:
+                                    self.current_subprocess = p
+                                p.stdin.write(content_to_type.encode('utf-8'))
+                                p.stdin.close()
+                                # Wait for completion while polling stop_event for sub-millisecond abort
+                                while p.poll() is None:
+                                    if self.stop_event.is_set():
+                                        try:
+                                            p.terminate()
+                                            p.kill()
+                                        except Exception:
+                                            pass
+                                        break
+                                    time.sleep(0.01)
+                                with self.subprocess_lock:
+                                    self.current_subprocess = None
                             elif HAS_PYNPUT:
                                 self._type_via_pynput(content_to_type, base_delay_ms)
                         except Exception as e: 
