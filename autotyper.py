@@ -179,7 +179,7 @@ class UniversalGlobalInputListener:
         return None
 
     def _linux_evdev_loop(self):
-        """Reads raw evdev packets for KEY_ESC (code 1) and BTN_LEFT (code 0x110) across hardware input devices."""
+        """Reads raw evdev packets for KEY_ESC (code 1) and pointer clicks across hardware input devices."""
         import glob
         import select
         import struct
@@ -187,12 +187,12 @@ class UniversalGlobalInputListener:
 
         KEY_ESC = 1
         BTN_LEFT = 0x110
+        BTN_TOUCH = 0x14a
         EV_KEY = 1
         EVENT_SIZE = 24
         EVENT_FORMAT = 'qqHHi'
 
         device_fds = []
-        # Find all event nodes
         for ev_path in glob.glob('/dev/input/event*'):
             try:
                 fd = os.open(ev_path, os.O_RDONLY | os.O_NONBLOCK)
@@ -206,7 +206,7 @@ class UniversalGlobalInputListener:
         try:
             while self.running:
                 try:
-                    r, _, _ = select.select(device_fds, [], [], 0.1)
+                    r, _, _ = select.select(device_fds, [], [], 0.05)
                 except Exception:
                     break
                 for fd in r:
@@ -221,8 +221,8 @@ class UniversalGlobalInputListener:
                                 if ev_type == EV_KEY and ev_value in (1, 2):
                                     if ev_code == KEY_ESC:
                                         self.esc_callback()
-                                    elif ev_code == BTN_LEFT and self.app and self.app.is_active:
-                                        # When typing is active, check if the click target is the AutoTyper app
+                                    elif ev_code in (BTN_LEFT, BTN_TOUCH) and self.app and self.app.is_active:
+                                        # Immediate window geometry check
                                         cur = self._get_hyprctl_cursor()
                                         if cur:
                                             cx, cy = cur
@@ -232,6 +232,14 @@ class UniversalGlobalInputListener:
                                                 rw = self.app.root.winfo_width()
                                                 rh = self.app.root.winfo_height()
                                                 if rx <= cx <= rx + rw and ry <= cy <= ry + rh:
+                                                    self.esc_callback()
+                                            except Exception:
+                                                pass
+                                        else:
+                                            # Fallback if cursor position query fails: check active window
+                                            try:
+                                                out = subprocess.check_output(['hyprctl', 'activewindow', '-j'], stderr=subprocess.DEVNULL).decode()
+                                                if 'Typer' in out:
                                                     self.esc_callback()
                                             except Exception:
                                                 pass
@@ -311,9 +319,29 @@ class AutoTyperApp:
         # Local window bindings
         self.root.bind("<Escape>", lambda e: self.stop_process())
         self.root.bind_all("<ButtonPress-1>", self._handle_window_click)
+        self.root.bind_all("<ButtonRelease-1>", self._handle_window_click)
 
         self.setup_ui()
         self.set_os(self.selected_os)
+
+        # On Hyprland / Wayland, configure window as floating and pinned so it's always accessible
+        if is_wayland and shutil.which("hyprctl"):
+            self.root.after(200, self._ensure_hyprland_floating)
+
+    def _ensure_hyprland_floating(self):
+        try:
+            # Query if window is already floating
+            out = subprocess.check_output(['hyprctl', 'clients', '-j'], stderr=subprocess.DEVNULL).decode()
+            import json
+            for client in json.loads(out):
+                if client.get('title') == 'Typer' or client.get('initialTitle') == 'Typer':
+                    if not client.get('floating'):
+                        subprocess.run(['hyprctl', 'dispatch', 'togglefloating', f"address:{client['address']}"], check=False)
+                    if not client.get('pinned'):
+                        subprocess.run(['hyprctl', 'dispatch', 'pin', f"address:{client['address']}"], check=False)
+                    break
+        except Exception:
+            pass
 
     def _handle_window_click(self, event):
         """Immediately abort if user clicks the Stop button or anywhere in the window while typing is active."""
@@ -329,7 +357,7 @@ class AutoTyperApp:
                 break
             except Exception as e:
                 print(f"UI Queue Error: {e}")
-        self.root.after(40, self.process_ui_queue)
+        self.root.after(10, self.process_ui_queue)
 
     def ui_call(self, fn):
         self.ui_queue.put(fn)
@@ -428,7 +456,16 @@ class AutoTyperApp:
             self.lbl_backend.config(text=f"[{self.backend_name}]")
 
     def set_status(self, text, fg):
-        self.ui_call(lambda: self.lbl_status.config(text=text, fg=fg))
+        def _set():
+            try:
+                self.lbl_status.config(text=text, fg=fg)
+                self.lbl_status.update_idletasks()
+            except Exception:
+                pass
+        if threading.current_thread() is threading.main_thread():
+            _set()
+        else:
+            self.ui_call(_set)
 
     def start_process(self):
         try: 
@@ -486,17 +523,24 @@ class AutoTyperApp:
 
     def toggle_ui(self, is_running):
         def _apply():
-            if is_running:
-                self.btn_stop.config(bg="#ff1a1a", fg="white", cursor="hand2")
-                self.btn_start.config(state="disabled", bg="#333", fg="#555")
-                self.btn_stealth.config(state="disabled", bg="#333", fg="#555")
-                self.btn_speak.config(state="disabled", bg="#333", fg="#555")
-            else:
-                self.btn_stop.config(bg=THEME["danger"], fg="white", cursor="hand2")
-                self.btn_start.config(state="normal", bg=THEME["success"], fg="#111")
-                self.btn_stealth.config(state="normal", bg=THEME["stealth"], fg="#111")
-                if HAS_SPEECH: self.btn_speak.config(state="normal", bg=THEME["accent"], fg="#111")
-        self.ui_call(_apply)
+            try:
+                if is_running:
+                    self.btn_stop.config(bg="#ff1a1a", fg="white", cursor="hand2")
+                    self.btn_start.config(state="disabled", bg="#333", fg="#555")
+                    self.btn_stealth.config(state="disabled", bg="#333", fg="#555")
+                    self.btn_speak.config(state="disabled", bg="#333", fg="#555")
+                else:
+                    self.btn_stop.config(bg=THEME["danger"], fg="white", cursor="hand2")
+                    self.btn_start.config(state="normal", bg=THEME["success"], fg="#111")
+                    self.btn_stealth.config(state="normal", bg=THEME["stealth"], fg="#111")
+                    if HAS_SPEECH: self.btn_speak.config(state="normal", bg=THEME["accent"], fg="#111")
+                self.root.update_idletasks()
+            except Exception:
+                pass
+        if threading.current_thread() is threading.main_thread():
+            _apply()
+        else:
+            self.ui_call(_apply)
 
     def listen_logic(self):
         try:
