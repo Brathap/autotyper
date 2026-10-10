@@ -124,6 +124,97 @@ class NativeKeyboard:
         return True
 
 
+class UniversalGlobalEscListener:
+    """Listens globally for ESC key presses across Wayland, X11, Windows, and macOS without requiring pynput."""
+    def __init__(self, callback):
+        self.callback = callback
+        self.running = True
+        self.threads = []
+        self._start()
+
+    def _start(self):
+        sys_name = platform.system()
+        if sys_name == "Windows":
+            t = threading.Thread(target=self._win_loop, daemon=True)
+            t.start()
+            self.threads.append(t)
+        elif sys_name == "Linux":
+            # 1. Direct /dev/input raw hardware listener (works 100% on Wayland/Hyprland)
+            t_input = threading.Thread(target=self._linux_evdev_loop, daemon=True)
+            t_input.start()
+            self.threads.append(t_input)
+            # 2. Pynput fallback if available
+            if HAS_PYNPUT:
+                try:
+                    def _on_press(key):
+                        if key == Key.esc:
+                            self.callback()
+                    l = Listener(on_press=_on_press)
+                    l.daemon = True
+                    l.start()
+                except Exception:
+                    pass
+
+    def _win_loop(self):
+        if not hasattr(ctypes, 'windll'):
+            return
+        user32 = ctypes.windll.user32
+        VK_ESCAPE = 0x1B
+        while self.running:
+            # Check most significant bit of GetAsyncKeyState
+            if user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000:
+                self.callback()
+                time.sleep(0.3)  # Debounce
+            time.sleep(0.015)
+
+    def _linux_evdev_loop(self):
+        """Reads raw keyboard evdev packets for KEY_ESC (code 1) across all keyboard devices."""
+        import glob
+        import select
+        import struct
+
+        KEY_ESC = 1
+        EV_KEY = 1
+        # struct input_event: timeval (16 bytes), type (2 bytes), code (2 bytes), value (4 bytes)
+        EVENT_SIZE = 24
+        EVENT_FORMAT = 'qqHHi'
+
+        device_files = []
+        # Find keyboard event nodes
+        for ev_path in glob.glob('/dev/input/event*'):
+            try:
+                f = open(ev_path, 'rb', buffering=0)
+                device_files.append(f)
+            except Exception:
+                continue
+
+        if not device_files:
+            return
+
+        try:
+            while self.running:
+                r, _, _ = select.select(device_files, [], [], 0.2)
+                for fd in r:
+                    try:
+                        data = fd.read(EVENT_SIZE)
+                        if len(data) >= EVENT_SIZE:
+                            _, _, ev_type, ev_code, ev_value = struct.unpack(EVENT_FORMAT, data[:EVENT_SIZE])
+                            # EV_KEY event, KEY_ESC, and press (value == 1)
+                            if ev_type == EV_KEY and ev_code == KEY_ESC and ev_value == 1:
+                                self.callback()
+                    except Exception:
+                        pass
+        finally:
+            for fd in device_files:
+                try:
+                    fd.close()
+                except Exception:
+                    pass
+
+    def stop(self):
+        self.running = False
+
+
 class AutoTyperApp:
     def __init__(self, root):
         self.root = root
@@ -178,19 +269,8 @@ class AutoTyperApp:
         self.current_subprocess = None
         self.subprocess_lock = threading.Lock()
 
-        # Global hotkey listener (ESC key) for instant emergency abort
-        self.hotkey_listener = None
-        if HAS_PYNPUT:
-            try:
-                def _on_global_press(key):
-                    if key == Key.esc and not self.stop_event.is_set():
-                        # Immediately abort on ESC
-                        self.stop_process()
-                self.hotkey_listener = Listener(on_press=_on_global_press)
-                self.hotkey_listener.daemon = True
-                self.hotkey_listener.start()
-            except Exception as e:
-                print(f"Hotkey listener error: {e}")
+        # Universal Global hotkey listener (ESC key) for instant emergency abort across all apps
+        self.esc_listener = UniversalGlobalEscListener(self.stop_process)
 
         # Local window binding for ESC key
         self.root.bind("<Escape>", lambda e: self.stop_process())
