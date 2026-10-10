@@ -237,8 +237,10 @@ class UniversalGlobalInputListener:
                                     if ev_code == KEY_ESC:
                                         self.esc_callback()
                                     elif ev_code in (BTN_LEFT, BTN_TOUCH) and self.app and self.app.is_active:
-                                        if self._is_pointer_over_app():
-                                            self.esc_callback()
+                                        # Only trigger if active and at least 0.5s after clicking start (debounce initial click)
+                                        if time.time() - getattr(self.app, 'start_time', 0) > 0.5:
+                                            if self._is_pointer_over_app():
+                                                self.esc_callback()
                     except BlockingIOError:
                         pass
                     except Exception:
@@ -306,6 +308,7 @@ class AutoTyperApp:
 
         self.stop_event = threading.Event()
         self.is_active = False
+        self.start_time = 0
         self.current_subprocess = None
         self.subprocess_lock = threading.Lock()
         self.window_bbox = None
@@ -316,8 +319,6 @@ class AutoTyperApp:
         # Local window bindings
         self.root.bind("<Escape>", lambda e: self.stop_process())
         self.root.bind("<Configure>", self._update_window_bbox)
-        self.root.bind_all("<ButtonPress-1>", self._handle_window_click)
-        self.root.bind_all("<ButtonRelease-1>", self._handle_window_click)
 
         self.setup_ui()
         self.set_os(self.selected_os)
@@ -349,8 +350,8 @@ class AutoTyperApp:
             pass
 
     def _handle_window_click(self, event):
-        """Immediately abort if user clicks the Stop button or anywhere in the window while typing is active."""
-        if self.is_active:
+        """Immediately abort if user clicks the Stop button while process is active."""
+        if self.is_active and event.widget == self.btn_stop:
             self.stop_process()
 
     def process_ui_queue(self):
@@ -507,6 +508,7 @@ class AutoTyperApp:
 
     def start_generic(self, target, args):
         self.stop_event.clear()
+        self.start_time = time.time()
         self.is_active = True
         self.toggle_ui(True)
         threading.Thread(target=target, args=args, daemon=True).start()
