@@ -124,10 +124,11 @@ class NativeKeyboard:
         return True
 
 
-class UniversalGlobalEscListener:
-    """Listens globally for ESC key presses across Wayland, X11, Windows, and macOS without requiring pynput."""
-    def __init__(self, callback):
-        self.callback = callback
+class UniversalGlobalInputListener:
+    """Listens globally for ESC key presses and mouse clicks across Wayland, X11, Windows, and macOS without requiring pynput."""
+    def __init__(self, esc_callback, app=None):
+        self.esc_callback = esc_callback
+        self.app = app
         self.running = True
         self.threads = []
         self._start()
@@ -139,7 +140,7 @@ class UniversalGlobalEscListener:
             t.start()
             self.threads.append(t)
         elif sys_name == "Linux":
-            # 1. Direct /dev/input raw hardware listener (works 100% on Wayland/Hyprland)
+            # 1. Direct /dev/input raw hardware listener for ESC and mouse click interception
             t_input = threading.Thread(target=self._linux_evdev_loop, daemon=True)
             t_input.start()
             self.threads.append(t_input)
@@ -148,7 +149,7 @@ class UniversalGlobalEscListener:
                 try:
                     def _on_press(key):
                         if key == Key.esc:
-                            self.callback()
+                            self.esc_callback()
                     l = Listener(on_press=_on_press)
                     l.daemon = True
                     l.start()
@@ -163,24 +164,35 @@ class UniversalGlobalEscListener:
         while self.running:
             # Check most significant bit of GetAsyncKeyState
             if user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000:
-                self.callback()
+                self.esc_callback()
                 time.sleep(0.3)  # Debounce
             time.sleep(0.015)
 
+    def _get_hyprctl_cursor(self):
+        try:
+            out = subprocess.check_output(['hyprctl', 'cursorpos'], stderr=subprocess.DEVNULL).decode()
+            parts = [p.strip() for p in out.strip().split(',')]
+            if len(parts) == 2:
+                return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+        return None
+
     def _linux_evdev_loop(self):
-        """Reads raw keyboard evdev packets for KEY_ESC (code 1) across all keyboard devices."""
+        """Reads raw evdev packets for KEY_ESC (code 1) and BTN_LEFT (code 0x110) across hardware input devices."""
         import glob
         import select
         import struct
         import os
 
         KEY_ESC = 1
+        BTN_LEFT = 0x110
         EV_KEY = 1
         EVENT_SIZE = 24
         EVENT_FORMAT = 'qqHHi'
 
         device_fds = []
-        # Find keyboard event nodes
+        # Find all event nodes
         for ev_path in glob.glob('/dev/input/event*'):
             try:
                 fd = os.open(ev_path, os.O_RDONLY | os.O_NONBLOCK)
@@ -203,13 +215,26 @@ class UniversalGlobalEscListener:
                             data = os.read(fd, EVENT_SIZE * 16)
                             if not data:
                                 break
-                            # Parse all 24-byte event structs in chunk
                             for offset in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
                                 chunk = data[offset:offset + EVENT_SIZE]
                                 _, _, ev_type, ev_code, ev_value = struct.unpack(EVENT_FORMAT, chunk)
-                                # EV_KEY event, KEY_ESC, and press (value == 1 or 2)
-                                if ev_type == EV_KEY and ev_code == KEY_ESC and ev_value in (1, 2):
-                                    self.callback()
+                                if ev_type == EV_KEY and ev_value in (1, 2):
+                                    if ev_code == KEY_ESC:
+                                        self.esc_callback()
+                                    elif ev_code == BTN_LEFT and self.app and self.app.is_active:
+                                        # When typing is active, check if the click target is the AutoTyper app
+                                        cur = self._get_hyprctl_cursor()
+                                        if cur:
+                                            cx, cy = cur
+                                            try:
+                                                rx = self.app.root.winfo_rootx()
+                                                ry = self.app.root.winfo_rooty()
+                                                rw = self.app.root.winfo_width()
+                                                rh = self.app.root.winfo_height()
+                                                if rx <= cx <= rx + rw and ry <= cy <= ry + rh:
+                                                    self.esc_callback()
+                                            except Exception:
+                                                pass
                     except BlockingIOError:
                         pass
                     except Exception:
@@ -276,17 +301,24 @@ class AutoTyperApp:
             self.backend_name = "Need wtype/xdotool"
 
         self.stop_event = threading.Event()
+        self.is_active = False
         self.current_subprocess = None
         self.subprocess_lock = threading.Lock()
 
-        # Universal Global hotkey listener (ESC key) for instant emergency abort across all apps
-        self.esc_listener = UniversalGlobalEscListener(self.stop_process)
+        # Universal Global hotkey and mouse click listener for instant emergency abort across all apps
+        self.esc_listener = UniversalGlobalInputListener(self.stop_process, app=self)
 
-        # Local window binding for ESC key
+        # Local window bindings
         self.root.bind("<Escape>", lambda e: self.stop_process())
+        self.root.bind_all("<ButtonPress-1>", self._handle_window_click)
 
         self.setup_ui()
         self.set_os(self.selected_os)
+
+    def _handle_window_click(self, event):
+        """Immediately abort if user clicks the Stop button or anywhere in the window while typing is active."""
+        if self.is_active:
+            self.stop_process()
 
     def process_ui_queue(self):
         while not self.ui_queue.empty():
@@ -433,11 +465,13 @@ class AutoTyperApp:
 
     def start_generic(self, target, args):
         self.stop_event.clear()
+        self.is_active = True
         self.toggle_ui(True)
         threading.Thread(target=target, args=args, daemon=True).start()
 
     def stop_process(self):
         self.stop_event.set()
+        self.is_active = False
         # Immediately terminate any active typing subprocess (wtype / xdotool)
         with self.subprocess_lock:
             if self.current_subprocess and self.current_subprocess.poll() is None:
@@ -490,6 +524,7 @@ class AutoTyperApp:
             self.set_status("NO SPEECH", THEME["danger"])
         finally:
             if not self.stop_event.is_set():
+                self.is_active = False
                 self.toggle_ui(False)
 
     def run_logic(self, text, is_stealth=False):
@@ -519,6 +554,7 @@ class AutoTyperApp:
             if not self.stop_event.is_set():
                 self.set_status("DONE", "white")
         if not self.stop_event.is_set():
+            self.is_active = False
             self.toggle_ui(False)
 
     def send_key(self, key):
@@ -701,12 +737,26 @@ class AutoTyperApp:
 
     def _send_single_char(self, char):
         """Sends a single character using the active platform driver (zero-dependency compatible)."""
+        if self.stop_event.is_set():
+            return
         if self.selected_os == "Linux":
             try:
-                if self.tool == "wtype":
-                    subprocess.run(["wtype", "-"], input=char.encode('utf-8'), check=False)
-                elif self.tool == "xdotool":
-                    subprocess.run(["xdotool", "type", "--clearmodifiers", "--file", "-"], input=char.encode('utf-8'), check=False)
+                cmd = ["wtype", "-"] if self.tool == "wtype" else (["xdotool", "type", "--clearmodifiers", "--file", "-"] if self.tool == "xdotool" else None)
+                if cmd:
+                    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    with self.subprocess_lock:
+                        self.current_subprocess = proc
+                    try:
+                        proc.communicate(input=char.encode('utf-8'), timeout=0.5)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    finally:
+                        with self.subprocess_lock:
+                            if self.current_subprocess == proc:
+                                self.current_subprocess = None
                 elif HAS_PYNPUT:
                     keyboard.type(char)
             except Exception:
