@@ -7,21 +7,23 @@ import shutil
 import sys
 import math
 import platform
+import queue
+import ctypes
 
-# --- CROSS-PLATFORM KEYBOARD ENGINE ---
-try:
-    from pynput.keyboard import Key, Controller as KeyboardController
-    keyboard = KeyboardController()
-    HAS_PYNPUT = True
-except ImportError:
-    HAS_PYNPUT = False
-
-# --- SPEECH LIBRARY ---
+# --- CHECK FOR OPTIONAL SPEECH LIBRARY ---
 try:
     import speech_recognition as sr
     HAS_SPEECH = True
 except ImportError:
     HAS_SPEECH = False
+
+# --- CHECK FOR OPTIONAL PYNPUT LIBRARY ---
+try:
+    from pynput.keyboard import Key, Controller
+    keyboard = Controller()
+    HAS_PYNPUT = True
+except ImportError:
+    HAS_PYNPUT = False
 
 # --- THEME CONFIGURATION ---
 THEME = {
@@ -39,54 +41,177 @@ FONT_HEADER = ("Segoe UI", 12, "bold")
 FONT_LABEL = ("Segoe UI", 9)
 FONT_BTN = ("Segoe UI", 10, "bold")
 
+# --- ZERO-DEPENDENCY NATIVE TYPERS (Standard Library Only) ---
+class NativeKeyboard:
+    """Provides pure standard-library keyboard simulation for Windows and macOS when pynput is not installed."""
+
+    @staticmethod
+    def is_windows():
+        return platform.system() == "Windows"
+
+    @staticmethod
+    def is_mac():
+        return platform.system() == "Darwin"
+
+    # --- Windows Native Win32 API Implementation via ctypes ---
+    @staticmethod
+    def win32_send_unicode_char(char):
+        if not hasattr(ctypes, 'windll'):
+            return False
+        user32 = ctypes.windll.user32
+        KEYEVENTF_UNICODE = 0x0004
+        KEYEVENTF_KEYUP = 0x0002
+
+        # Send UTF-16 character code
+        for unit in char.encode('utf-16-le'):
+            pass  # UTF-16 code units
+        code = ord(char)
+        if code > 0xFFFF:
+            # Surrogate pair
+            high = 0xD800 + ((code - 0x10000) >> 10)
+            low = 0xDC00 + ((code - 0x10000) & 0x3FF)
+            user32.keybd_event(0, high, KEYEVENTF_UNICODE, 0)
+            user32.keybd_event(0, high, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(0, low, KEYEVENTF_UNICODE, 0)
+            user32.keybd_event(0, low, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0)
+        else:
+            user32.keybd_event(0, code, KEYEVENTF_UNICODE, 0)
+            user32.keybd_event(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0)
+        return True
+
+    @staticmethod
+    def win32_send_key(vk_code, shift=False):
+        if not hasattr(ctypes, 'windll'):
+            return False
+        user32 = ctypes.windll.user32
+        VK_SHIFT = 0x10
+        KEYEVENTF_KEYUP = 0x0002
+
+        if shift:
+            user32.keybd_event(VK_SHIFT, 0, 0, 0)
+        user32.keybd_event(vk_code, 0, 0, 0)
+        user32.keybd_event(vk_code, 0, KEYEVENTF_KEYUP, 0)
+        if shift:
+            user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+        return True
+
+    # --- macOS Native AppleScript Implementation via osascript ---
+    @staticmethod
+    def mac_send_text(text):
+        if not shutil.which("osascript"):
+            return False
+        # Escape quotes and backslashes for AppleScript string literal
+        escaped = text.replace('\\', '\\\\').replace('"', '\\"')
+        script = f'tell application "System Events" to keystroke "{escaped}"'
+        subprocess.run(["osascript", "-e", script], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+
+    @staticmethod
+    def mac_send_key(key, shift=False):
+        if not shutil.which("osascript"):
+            return False
+        # key code 36 = Return, key code 51 = Delete/Backspace
+        code = 36 if key == "Return" else (51 if key == "BackSpace" else None)
+        if code is None:
+            return False
+        if shift:
+            script = f'tell application "System Events" to key code {code} using shift down'
+        else:
+            script = f'tell application "System Events" to key code {code}'
+        subprocess.run(["osascript", "-e", script], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+
+
 class AutoTyperApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Universal AutoTyper")
-        self.root.geometry("340x620") 
+        self.root.title("Typer")
+        self.root.geometry("300x560") 
         self.root.configure(bg=THEME["bg_app"])
         self.root.attributes('-topmost', True)
 
-        # Linux native tools check
+        # Thread-safe UI update queue
+        self.ui_queue = queue.Queue()
+        self.root.after(40, self.process_ui_queue)
+
+        # Autodetect OS
+        current_sys = platform.system()
+        if current_sys == "Darwin":
+            detected_os = "macOS"
+        elif current_sys == "Windows":
+            detected_os = "Windows"
+        else:
+            detected_os = "Linux"
+
+        self.selected_os = detected_os
+
+        # Detect Linux typing backend based on active display server
         self.tool = None
-        if shutil.which("wtype"): 
-            self.tool = "wtype"
-        elif shutil.which("xdotool"): 
-            self.tool = "xdotool"
+        self.backend_name = "Universal"
+        session_type = sys.platform
+        is_wayland = bool(platform.system() == "Linux" and (subprocess.os.environ.get("WAYLAND_DISPLAY") or subprocess.os.environ.get("XDG_SESSION_TYPE") == "wayland"))
+        
+        if is_wayland:
+            if shutil.which("wtype"):
+                self.tool = "wtype"
+                self.backend_name = "Wayland"
+            elif shutil.which("xdotool"):
+                self.tool = "xdotool"
+                self.backend_name = "XWayland"
+        else:
+            if shutil.which("xdotool"):
+                self.tool = "xdotool"
+                self.backend_name = "X11"
+            elif shutil.which("wtype"):
+                self.tool = "wtype"
+                self.backend_name = "Wayland"
+
+        if not self.tool and HAS_PYNPUT:
+            self.tool = "pynput"
+            self.backend_name = "Pynput"
+        elif not self.tool and platform.system() == "Linux":
+            self.backend_name = "Need wtype/xdotool"
 
         self.stop_event = threading.Event()
-        
-        # Set a default manual OS to start with
-        self.selected_os = "Linux" 
         self.setup_ui()
-        self.set_os(self.selected_os) # Initialize colors
+        self.set_os(self.selected_os)
+
+    def process_ui_queue(self):
+        while not self.ui_queue.empty():
+            try:
+                fn = self.ui_queue.get_nowait()
+                fn()
+            except queue.Empty:
+                break
+            except Exception as e:
+                print(f"UI Queue Error: {e}")
+        self.root.after(40, self.process_ui_queue)
+
+    def ui_call(self, fn):
+        self.ui_queue.put(fn)
+
+    def sleep_interruptible(self, duration_sec):
+        """Sleeps for duration_sec unless stop_event is set. Returns True if completed, False if stopped."""
+        return not self.stop_event.wait(max(0.0, duration_sec))
 
     def setup_ui(self):
-        tk.Label(self.root, text="CODE TYPER", bg=THEME["bg_app"], fg=THEME["success"], font=FONT_HEADER).pack(pady=(15, 2))
-        
-        # --- OS SELECTION BUTTONS (FULLY MANUAL) ---
-        os_card = tk.Frame(self.root, bg=THEME["bg_card"], padx=10, pady=8)
-        os_card.pack(fill="x", padx=15, pady=(5, 10))
+        tk.Label(self.root, text="CODE TYPER", bg=THEME["bg_app"], fg=THEME["success"], font=FONT_HEADER).pack(pady=(20, 5))
+        self.lbl_backend = tk.Label(self.root, text=f"[{self.backend_name}]", bg=THEME["bg_app"], fg="#555", font=("Segoe UI", 8))
+        self.lbl_backend.pack(pady=(0, 10))
 
-        tk.Label(os_card, text="MANUAL OS SELECTION", bg=THEME["bg_card"], fg="#888", font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(0, 5))
-        
-        f_os_btns = tk.Frame(os_card, bg=THEME["bg_card"])
-        f_os_btns.pack(fill="x")
-
-        self.btn_win = tk.Button(f_os_btns, text="Windows", bg="#333", fg="white", font=("Segoe UI", 8, "bold"),
-                                 relief="flat", cursor="hand2", command=lambda: self.set_os("Windows"))
+        # --- OS SELECTION BUTTONS ---
+        f_os = tk.Frame(self.root, bg=THEME["bg_app"])
+        f_os.pack(fill="x", padx=20, pady=(0, 10))
+        self.btn_win = tk.Button(f_os, text="Win", bg="#333", fg="white", font=("Segoe UI", 8, "bold"), relief="flat", command=lambda: self.set_os("Windows"))
         self.btn_win.pack(side="left", expand=True, fill="x", padx=2)
-
-        self.btn_mac = tk.Button(f_os_btns, text="macOS", bg="#333", fg="white", font=("Segoe UI", 8, "bold"),
-                                 relief="flat", cursor="hand2", command=lambda: self.set_os("macOS"))
+        self.btn_mac = tk.Button(f_os, text="Mac", bg="#333", fg="white", font=("Segoe UI", 8, "bold"), relief="flat", command=lambda: self.set_os("macOS"))
         self.btn_mac.pack(side="left", expand=True, fill="x", padx=2)
-
-        self.btn_linux = tk.Button(f_os_btns, text="Linux", bg="#333", fg="white", font=("Segoe UI", 8, "bold"),
-                                   relief="flat", cursor="hand2", command=lambda: self.set_os("Linux"))
+        self.btn_linux = tk.Button(f_os, text="Linux", bg=THEME["accent"], fg="#111", font=("Segoe UI", 8, "bold"), relief="flat", command=lambda: self.set_os("Linux"))
         self.btn_linux.pack(side="left", expand=True, fill="x", padx=2)
+        # ----------------------------
 
-        card = tk.Frame(self.root, bg=THEME["bg_card"], padx=15, pady=12)
-        card.pack(fill="x", padx=15)
+        card = tk.Frame(self.root, bg=THEME["bg_card"], padx=15, pady=15)
+        card.pack(fill="x", padx=20)
 
         tk.Label(card, text="Mode", bg=THEME["bg_card"], fg="#888", font=("Segoe UI", 8, "bold")).pack(anchor="w")
         
@@ -102,7 +227,7 @@ class AutoTyperApp:
         ttk.Radiobutton(f_modes, text="Raw (Simple)", variable=self.mode_var, value="Raw").pack(anchor="w")
         ttk.Radiobutton(f_modes, text="Trim (Auto-Fix Indent)", variable=self.mode_var, value="Trim").pack(anchor="w")
 
-        tk.Frame(card, height=1, bg="#444").pack(fill="x", pady=8)
+        tk.Frame(card, height=1, bg="#444").pack(fill="x", pady=10)
 
         speed_header = tk.Frame(card, bg=THEME["bg_card"])
         speed_header.pack(fill="x")
@@ -118,225 +243,303 @@ class AutoTyperApp:
         self.speed_scale.configure(command=lambda v: self.lbl_speed.config(text=f"{int(float(v))}ms"))
 
         self.lbl_status = tk.Label(self.root, text="READY", bg=THEME["bg_app"], fg="#666", font=("Segoe UI", 11, "bold"))
-        self.lbl_status.pack(pady=(15, 10))
+        self.lbl_status.pack(pady=(20, 10))
 
         BTN_WIDTH = 22
         
         self.btn_start = tk.Button(self.root, text="START TYPING", bg=THEME["success"], fg="#111",
                                    font=FONT_BTN, command=self.start_process, relief="flat", width=BTN_WIDTH, cursor="hand2")
-        self.btn_start.pack(pady=4)
+        self.btn_start.pack(pady=6)
 
         txt_speak = "🎤 SPEAK" if HAS_SPEECH else "NO SPEECH LIB"
         self.btn_speak = tk.Button(self.root, text=txt_speak, bg=THEME["accent"], fg="#111",
                                    font=FONT_BTN, command=self.start_speak, relief="flat", width=BTN_WIDTH, cursor="hand2")
         if not HAS_SPEECH: self.btn_speak.config(state="disabled", bg="#333")
-        self.btn_speak.pack(pady=4)
+        self.btn_speak.pack(pady=6)
 
         self.btn_stop = tk.Button(self.root, text="STOP", bg="#333", fg="#666", font=FONT_BTN, command=self.stop_process, relief="flat", width=BTN_WIDTH, state="disabled")
-        self.btn_stop.pack(pady=4)
+        self.btn_stop.pack(pady=6)
 
+    # --- OS LOGIC ---
     def set_os(self, os_name):
-        """Manually sets the OS and updates the UI button colors"""
         self.selected_os = os_name
-        
         self.btn_win.config(bg="#333", fg="#aaa")
         self.btn_mac.config(bg="#333", fg="#aaa")
         self.btn_linux.config(bg="#333", fg="#aaa")
-
-        if self.selected_os == "Windows":
+        if os_name == "Windows": 
             self.btn_win.config(bg=THEME["accent"], fg="#111")
-        elif self.selected_os == "macOS":
+            backend_label = "[Pynput / Win]" if HAS_PYNPUT else "[Native Win32]"
+            self.lbl_backend.config(text=backend_label)
+        elif os_name == "macOS": 
             self.btn_mac.config(bg=THEME["accent"], fg="#111")
-        elif self.selected_os == "Linux":
+            backend_label = "[Pynput / macOS]" if HAS_PYNPUT else "[Native AppleScript]"
+            self.lbl_backend.config(text=backend_label)
+        elif os_name == "Linux": 
             self.btn_linux.config(bg=THEME["accent"], fg="#111")
+            self.lbl_backend.config(text=f"[{self.backend_name}]")
 
-    def check_os_mismatch(self):
-        """Strictly blocks typing if the manual selection doesn't match reality"""
-        actual_system = platform.system()
-        
-        # Map Python's platform.system() names to our button names
-        if actual_system == "Windows": mapped_os = "Windows"
-        elif actual_system == "Darwin": mapped_os = "macOS"
-        else: mapped_os = "Linux"
-
-        if self.selected_os != mapped_os:
-            return True # There IS a mismatch
-        return False
+    def set_status(self, text, fg):
+        self.ui_call(lambda: self.lbl_status.config(text=text, fg=fg))
 
     def start_process(self):
-        # 1. First, check if the manual choice is actually valid for this computer
-        if self.check_os_mismatch():
-            self.lbl_status.config(text=f"ERROR: NOT {self.selected_os.upper()}", fg=THEME["danger"])
+        try: 
+            text = self.root.clipboard_get()
+        except Exception: 
+            self.set_status("CLIPBOARD EMPTY", THEME["danger"])
             return
 
-        # 2. Then, check the clipboard
-        try: text = self.root.clipboard_get()
-        except: 
-            self.lbl_status.config(text="CLIPBOARD EMPTY", fg=THEME["danger"])
+        if not text:
+            self.set_status("CLIPBOARD EMPTY", THEME["danger"])
             return
-        
+
         self.start_generic(self.run_logic, (text,))
 
     def start_speak(self):
-        if self.check_os_mismatch():
-            self.lbl_status.config(text=f"ERROR: NOT {self.selected_os.upper()}", fg=THEME["danger"])
+        if not HAS_SPEECH:
+            self.set_status("NO SPEECH LIB", THEME["danger"])
             return
-            
-        self.lbl_status.config(text="LISTENING...", fg=THEME["accent"])
+        self.set_status("LISTENING...", THEME["accent"])
         self.start_generic(self.listen_logic, ())
 
     def start_generic(self, target, args):
         self.stop_event.clear()
         self.toggle_ui(True)
-        threading.Thread(target=target, args=args).start()
+        threading.Thread(target=target, args=args, daemon=True).start()
 
     def stop_process(self):
         self.stop_event.set()
-        self.lbl_status.config(text="STOPPED", fg=THEME["danger"])
+        self.toggle_ui(False)
+        self.set_status("STOPPED", THEME["danger"])
 
     def toggle_ui(self, is_running):
-        if is_running:
-            self.btn_stop.config(state="normal", bg=THEME["danger"], fg="white")
-            self.btn_start.config(state="disabled", bg="#333", fg="#555")
-            self.btn_speak.config(state="disabled", bg="#333", fg="#555")
-        else:
-            self.btn_stop.config(state="disabled", bg="#333", fg="#666")
-            self.btn_start.config(state="normal", bg=THEME["success"], fg="#111")
-            if HAS_SPEECH: self.btn_speak.config(state="normal", bg=THEME["accent"], fg="#111")
+        def _apply():
+            if is_running:
+                self.btn_stop.config(state="normal", bg=THEME["danger"], fg="white")
+                self.btn_start.config(state="disabled", bg="#333", fg="#555")
+                self.btn_speak.config(state="disabled", bg="#333", fg="#555")
+            else:
+                self.btn_stop.config(state="disabled", bg="#333", fg="#666")
+                self.btn_start.config(state="normal", bg=THEME["success"], fg="#111")
+                if HAS_SPEECH: self.btn_speak.config(state="normal", bg=THEME["accent"], fg="#111")
+        self.ui_call(_apply)
 
     def listen_logic(self):
-        r = sr.Recognizer()
         try:
+            r = sr.Recognizer()
             with sr.Microphone() as source:
                 r.adjust_for_ambient_noise(source, duration=0.5)
-                self.lbl_status.config(text="SPEAK NOW...", fg=THEME["accent"])
+                self.set_status("SPEAK NOW...", THEME["accent"])
                 audio = r.listen(source, timeout=5, phrase_time_limit=15)
                 
-            self.lbl_status.config(text="PROCESSING...", fg="yellow")
+            self.set_status("PROCESSING...", "yellow")
             text = r.recognize_google(audio)
             
-            self.lbl_status.config(text="TYPING...", fg=THEME["success"])
-            time.sleep(1) 
+            self.set_status("TYPING...", THEME["success"])
+            if not self.sleep_interruptible(1.0):
+                return
             self.type_loop(text)
-            self.lbl_status.config(text="DONE", fg="white")
-        except:
-            self.lbl_status.config(text="NO SPEECH", fg=THEME["danger"])
-        self.toggle_ui(False)
+            if not self.stop_event.is_set():
+                self.set_status("DONE", "white")
+        except sr.WaitTimeoutError:
+            self.set_status("TIMEOUT", THEME["danger"])
+        except sr.UnknownValueError:
+            self.set_status("UNRECOGNIZED", THEME["danger"])
+        except Exception as e:
+            print(f"Speech error: {e}")
+            self.set_status("NO SPEECH", THEME["danger"])
+        finally:
+            if not self.stop_event.is_set():
+                self.toggle_ui(False)
 
     def run_logic(self, text):
         for i in range(5, 0, -1):
             if self.stop_event.is_set(): break
-            self.lbl_status.config(text=f"STARTING IN {i}...", fg="yellow")
-            time.sleep(1)
-        if not self.stop_event.is_set():
-            self.lbl_status.config(text="TYPING...", fg=THEME["success"])
+            self.set_status(f"STARTING IN {i}...", "yellow")
+            if not self.sleep_interruptible(1.0):
+                break
             
-            if self.selected_os == "Linux" and self.tool:
+        if not self.stop_event.is_set():
+            self.set_status("TYPING...", THEME["success"])
+            
+            if self.selected_os == "Linux":
                 try:
-                    if self.tool == "wtype": subprocess.run(["wtype", "-m", "ctrl", "-m", "shift", "-m", "alt", "-m", "logo"])
-                    else: subprocess.run(["xdotool", "keyup", "ctrl", "shift", "alt", "super"])
-                except: pass
-            elif HAS_PYNPUT:
-                for m in [Key.shift, Key.ctrl, Key.alt, Key.cmd]:
-                    keyboard.release(m)
-
+                    if self.tool == "wtype": 
+                        subprocess.run(["wtype", "-m", "ctrl", "-m", "shift", "-m", "alt", "-m", "logo"], check=False)
+                    elif self.tool == "xdotool": 
+                        subprocess.run(["xdotool", "keyup", "ctrl", "shift", "alt", "super"], check=False)
+                except Exception: 
+                    pass
+            
             self.type_loop(text)
-            self.lbl_status.config(text="DONE", fg="white")
-        self.toggle_ui(False)
+            if not self.stop_event.is_set():
+                self.set_status("DONE", "white")
+        if not self.stop_event.is_set():
+            self.toggle_ui(False)
 
-    def send_key(self, key_name):
-        if self.selected_os == "Linux" and self.tool:
+    def send_key(self, key):
+        if self.selected_os == "Linux":
             try:
-                if self.tool == "wtype":
-                    if key_name == "Shift+Return":
-                        subprocess.run(["wtype", "-M", "shift", "-k", "Return", "-m", "shift"])
-                    else:
-                        subprocess.run(["wtype", "-k", key_name])
-                elif self.tool == "xdotool":
-                    if key_name == "Shift+Return":
-                        subprocess.run(["xdotool", "key", "Shift+Return"])
-                    else:
-                        subprocess.run(["xdotool", "key", key_name])
-            except: pass
-        
+                if self.tool == "wtype": 
+                    subprocess.run(["wtype", "-k", key], check=False)
+                elif self.tool == "xdotool": 
+                    subprocess.run(["xdotool", "key", key], check=False)
+                elif HAS_PYNPUT:
+                    self._send_pynput_key(key)
+            except Exception: 
+                pass
         elif HAS_PYNPUT:
-            if key_name == "BackSpace":
+            self._send_pynput_key(key)
+        elif self.selected_os == "Windows":
+            # Native Windows without pynput
+            VK_RETURN = 0x0D
+            VK_BACK = 0x08
+            vk = VK_RETURN if key == "Return" else (VK_BACK if key == "BackSpace" else None)
+            if vk is not None:
+                NativeKeyboard.win32_send_key(vk)
+        elif self.selected_os == "macOS":
+            # Native macOS without pynput
+            NativeKeyboard.mac_send_key(key)
+
+    def _send_pynput_key(self, key):
+        try:
+            if key == "BackSpace":
                 keyboard.press(Key.backspace)
                 keyboard.release(Key.backspace)
-            elif key_name == "Return":
+            elif key == "Return":
                 keyboard.press(Key.enter)
                 keyboard.release(Key.enter)
-            elif key_name == "Shift+Return":
-                with keyboard.pressed(Key.shift):
-                    keyboard.press(Key.enter)
-                    keyboard.release(Key.enter)
-
-    def type_text_chunk(self, content_to_type, delay_ms):
-        delay_sec = delay_ms / 1000.0
-
-        if self.selected_os == "Linux" and self.tool:
-            try:
-                if self.tool == "wtype":
-                    subprocess.run(["wtype", "-d", str(delay_ms), "-"], input=content_to_type.encode('utf-8'))
-                elif self.tool == "xdotool":
-                    subprocess.run(["xdotool", "type", "--delay", str(delay_ms), "--clearmodifiers", "--file", "-"], input=content_to_type.encode('utf-8'))
-            except Exception as e:
-                print(f"Linux Typing Error: {e}")
-                
-        elif HAS_PYNPUT:
-            for char in content_to_type:
-                if self.stop_event.is_set(): break
-                keyboard.type(char)
-                if delay_sec > 0:
-                    time.sleep(delay_sec)
+        except Exception: 
+            pass
 
     def type_loop(self, text):
         delay_ms = int(self.speed_scale.get())
         mode = self.mode_var.get()
 
+        # Sanitize smart quotes and non-breaking spaces
         text = text.replace('\xa0', ' ').replace('\u00a0', ' ').replace('“', '"').replace('”', '"').replace('‘', "'").replace('’', "'")
-        text = text.encode('ascii', 'ignore').decode('ascii')
+        lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+        if text.endswith('\n') and lines and lines[-1] == '':
+            lines.pop()
 
-        if self.selected_os == "Windows":
-            lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-        else:
-            lines = text.split('\n')
-            
         total_lines = len(lines)
+
         last_indent = 0
         last_line_ended_colon = False
 
         for i, line in enumerate(lines):
-            if self.stop_event.is_set(): break
+            if self.stop_event.is_set(): 
+                break
             
-            content_to_type = line
+            clean_line = line.expandtabs(4)
+            has_content = bool(clean_line.strip())
+            content_to_type = line.lstrip() if mode == "Trim" else line
             
             if mode == "Trim":
-                clean_line = line.expandtabs(4)
-                curr_indent = len(clean_line) - len(clean_line.lstrip())
-                content_to_type = line.lstrip()
-
+                curr_indent = len(clean_line) - len(clean_line.lstrip()) if has_content else last_indent
                 expected_ide_indent = last_indent + (4 if last_line_ended_colon else 0)
                 
-                if curr_indent < expected_ide_indent:
+                if has_content and curr_indent < expected_ide_indent:
                     diff = expected_ide_indent - curr_indent
                     backspaces_needed = max(0, math.ceil(diff / 4))
                     for _ in range(backspaces_needed):
+                        if self.stop_event.is_set(): 
+                            break
                         self.send_key("BackSpace")
-                        time.sleep(delay_ms / 2000)
+                        if not self.sleep_interruptible(delay_ms / 2000.0):
+                            break
 
-                last_indent = curr_indent
-                last_line_ended_colon = content_to_type.strip().endswith(":")
+                if has_content:
+                    last_indent = curr_indent
+                    last_line_ended_colon = content_to_type.strip().endswith(":")
 
             if content_to_type:
-                self.type_text_chunk(content_to_type, delay_ms)
+                if self.selected_os == "Linux":
+                    try:
+                        if self.tool == "wtype":
+                            subprocess.run(["wtype", "-d", str(delay_ms), "-"], input=content_to_type.encode('utf-8'), check=False)
+                        elif self.tool == "xdotool":
+                            subprocess.run(["xdotool", "type", "--delay", str(delay_ms), "--clearmodifiers", "--file", "-"], input=content_to_type.encode('utf-8'), check=False)
+                        elif HAS_PYNPUT:
+                            self._type_via_pynput(content_to_type, delay_ms)
+                    except Exception as e: 
+                        print(f"Typing Error: {e}")
+                elif HAS_PYNPUT:
+                    self._type_via_pynput(content_to_type, delay_ms)
+                elif self.selected_os == "Windows":
+                    # Native Windows typing with ctypes User32 (zero external dependencies)
+                    delay_sec = delay_ms / 1000.0
+                    for char in content_to_type:
+                        if self.stop_event.is_set():
+                            break
+                        NativeKeyboard.win32_send_unicode_char(char)
+                        if delay_sec > 0 and not self.sleep_interruptible(delay_sec):
+                            break
+                elif self.selected_os == "macOS":
+                    # Native macOS typing via AppleScript osascript (zero external dependencies)
+                    delay_sec = delay_ms / 1000.0
+                    if delay_sec > 0.05:
+                        for char in content_to_type:
+                            if self.stop_event.is_set():
+                                break
+                            NativeKeyboard.mac_send_text(char)
+                            if not self.sleep_interruptible(delay_sec):
+                                break
+                    else:
+                        NativeKeyboard.mac_send_text(content_to_type)
 
-            if i < total_lines - 1:
-                if mode == "Smart":
-                    self.send_key("Shift+Return")
-                else:
-                    self.send_key("Return")
-                time.sleep(0.05)
+            if i < total_lines - 1 and not self.stop_event.is_set():
+                if self.selected_os == "Linux":
+                    try:
+                        if mode == "Smart":
+                            if self.tool == "wtype": 
+                                subprocess.run(["wtype", "-M", "shift", "-k", "Return", "-m", "shift"], check=False)
+                            elif self.tool == "xdotool": 
+                                subprocess.run(["xdotool", "key", "Shift+Return"], check=False)
+                            elif HAS_PYNPUT:
+                                with keyboard.pressed(Key.shift):
+                                    keyboard.press(Key.enter)
+                                    keyboard.release(Key.enter)
+                        else:
+                            if self.tool == "wtype": 
+                                subprocess.run(["wtype", "-k", "Return"], check=False)
+                            elif self.tool == "xdotool": 
+                                subprocess.run(["xdotool", "key", "Return"], check=False)
+                            elif HAS_PYNPUT:
+                                keyboard.press(Key.enter)
+                                keyboard.release(Key.enter)
+                        self.sleep_interruptible(0.1)
+                    except Exception: 
+                        pass
+                elif HAS_PYNPUT:
+                    try:
+                        if mode == "Smart":
+                            with keyboard.pressed(Key.shift):
+                                keyboard.press(Key.enter)
+                                keyboard.release(Key.enter)
+                        else:
+                            keyboard.press(Key.enter)
+                            keyboard.release(Key.enter)
+                        self.sleep_interruptible(0.1)
+                    except Exception: 
+                        pass
+                elif self.selected_os == "Windows":
+                    VK_RETURN = 0x0D
+                    shift_pressed = (mode == "Smart")
+                    NativeKeyboard.win32_send_key(VK_RETURN, shift=shift_pressed)
+                    self.sleep_interruptible(0.1)
+                elif self.selected_os == "macOS":
+                    shift_pressed = (mode == "Smart")
+                    NativeKeyboard.mac_send_key("Return", shift=shift_pressed)
+                    self.sleep_interruptible(0.1)
+
+    def _type_via_pynput(self, content, delay_ms):
+        delay_sec = delay_ms / 1000.0
+        for char in content:
+            if self.stop_event.is_set(): 
+                break
+            keyboard.type(char)
+            if delay_sec > 0 and not self.sleep_interruptible(delay_sec):
+                break
 
 if __name__ == "__main__":
     root = tk.Tk()
