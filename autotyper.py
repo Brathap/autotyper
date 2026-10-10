@@ -373,8 +373,9 @@ class AutoTyperApp:
         if not HAS_SPEECH: self.btn_speak.config(state="disabled", bg="#333")
         self.btn_speak.pack(pady=5)
 
-        self.btn_stop = tk.Button(self.root, text="⏹ STOP (ESC)", bg="#333", fg="#666", font=FONT_BTN, command=self.stop_process, relief="flat", width=BTN_WIDTH, state="disabled")
+        self.btn_stop = tk.Button(self.root, text="⏹ STOP (ESC)", bg=THEME["danger"], fg="white", font=FONT_BTN, command=self.stop_process, relief="flat", width=BTN_WIDTH, cursor="hand2")
         self.btn_stop.pack(pady=5)
+        self.btn_stop.bind("<Button-1>", lambda e: self.stop_process())
 
     # --- OS LOGIC ---
     def set_os(self, os_name):
@@ -452,12 +453,12 @@ class AutoTyperApp:
     def toggle_ui(self, is_running):
         def _apply():
             if is_running:
-                self.btn_stop.config(state="normal", bg=THEME["danger"], fg="white")
+                self.btn_stop.config(bg="#ff1a1a", fg="white", cursor="hand2")
                 self.btn_start.config(state="disabled", bg="#333", fg="#555")
                 self.btn_stealth.config(state="disabled", bg="#333", fg="#555")
                 self.btn_speak.config(state="disabled", bg="#333", fg="#555")
             else:
-                self.btn_stop.config(state="disabled", bg="#333", fg="#666")
+                self.btn_stop.config(bg=THEME["danger"], fg="white", cursor="hand2")
                 self.btn_start.config(state="normal", bg=THEME["success"], fg="#111")
                 self.btn_stealth.config(state="normal", bg=THEME["stealth"], fg="#111")
                 if HAS_SPEECH: self.btn_speak.config(state="normal", bg=THEME["accent"], fg="#111")
