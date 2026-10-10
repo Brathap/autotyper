@@ -178,6 +178,36 @@ class UniversalGlobalInputListener:
             pass
         return None
 
+    def _is_pointer_over_app(self):
+        """Ultra-fast, microsecond cursor check without blocking subprocess calls."""
+        if not self.app:
+            return False
+        try:
+            # Tkinter's internal XQueryPointer / XWayland root query is instantaneous (~0.2ms)
+            px, py = self.app.root.winfo_pointerxy()
+            rx = self.app.root.winfo_rootx()
+            ry = self.app.root.winfo_rooty()
+            rw = self.app.root.winfo_width()
+            rh = self.app.root.winfo_height()
+            if rx <= px <= rx + rw and ry <= py <= ry + rh:
+                return True
+        except Exception:
+            pass
+        # Fallback to hyprctl cursorpos only if pointerxy returns off-screen
+        cur = self._get_hyprctl_cursor()
+        if cur:
+            cx, cy = cur
+            try:
+                rx = self.app.root.winfo_rootx()
+                ry = self.app.root.winfo_rooty()
+                rw = self.app.root.winfo_width()
+                rh = self.app.root.winfo_height()
+                if rx <= cx <= rx + rw and ry <= cy <= ry + rh:
+                    return True
+            except Exception:
+                pass
+        return False
+
     def _linux_evdev_loop(self):
         """Reads raw evdev packets for KEY_ESC (code 1) and pointer clicks across hardware input devices."""
         import glob
@@ -206,7 +236,7 @@ class UniversalGlobalInputListener:
         try:
             while self.running:
                 try:
-                    r, _, _ = select.select(device_fds, [], [], 0.05)
+                    r, _, _ = select.select(device_fds, [], [], 0.02)
                 except Exception:
                     break
                 for fd in r:
@@ -222,27 +252,8 @@ class UniversalGlobalInputListener:
                                     if ev_code == KEY_ESC:
                                         self.esc_callback()
                                     elif ev_code in (BTN_LEFT, BTN_TOUCH) and self.app and self.app.is_active:
-                                        # Immediate window geometry check
-                                        cur = self._get_hyprctl_cursor()
-                                        if cur:
-                                            cx, cy = cur
-                                            try:
-                                                rx = self.app.root.winfo_rootx()
-                                                ry = self.app.root.winfo_rooty()
-                                                rw = self.app.root.winfo_width()
-                                                rh = self.app.root.winfo_height()
-                                                if rx <= cx <= rx + rw and ry <= cy <= ry + rh:
-                                                    self.esc_callback()
-                                            except Exception:
-                                                pass
-                                        else:
-                                            # Fallback if cursor position query fails: check active window
-                                            try:
-                                                out = subprocess.check_output(['hyprctl', 'activewindow', '-j'], stderr=subprocess.DEVNULL).decode()
-                                                if 'Typer' in out:
-                                                    self.esc_callback()
-                                            except Exception:
-                                                pass
+                                        if self._is_pointer_over_app():
+                                            self.esc_callback()
                     except BlockingIOError:
                         pass
                     except Exception:
@@ -785,13 +796,13 @@ class AutoTyperApp:
             return
         if self.selected_os == "Linux":
             try:
-                cmd = ["wtype", "-"] if self.tool == "wtype" else (["xdotool", "type", "--clearmodifiers", "--file", "-"] if self.tool == "xdotool" else None)
+                cmd = ["wtype", "--", char] if self.tool == "wtype" else (["xdotool", "type", "--clearmodifiers", "--", char] if self.tool == "xdotool" else None)
                 if cmd:
-                    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     with self.subprocess_lock:
                         self.current_subprocess = proc
                     try:
-                        proc.communicate(input=char.encode('utf-8'), timeout=0.5)
+                        proc.wait(timeout=0.2)
                     except Exception:
                         try:
                             proc.kill()
