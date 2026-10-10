@@ -172,42 +172,52 @@ class UniversalGlobalEscListener:
         import glob
         import select
         import struct
+        import os
 
         KEY_ESC = 1
         EV_KEY = 1
-        # struct input_event: timeval (16 bytes), type (2 bytes), code (2 bytes), value (4 bytes)
         EVENT_SIZE = 24
         EVENT_FORMAT = 'qqHHi'
 
-        device_files = []
+        device_fds = []
         # Find keyboard event nodes
         for ev_path in glob.glob('/dev/input/event*'):
             try:
-                f = open(ev_path, 'rb', buffering=0)
-                device_files.append(f)
+                fd = os.open(ev_path, os.O_RDONLY | os.O_NONBLOCK)
+                device_fds.append(fd)
             except Exception:
                 continue
 
-        if not device_files:
+        if not device_fds:
             return
 
         try:
             while self.running:
-                r, _, _ = select.select(device_files, [], [], 0.2)
+                try:
+                    r, _, _ = select.select(device_fds, [], [], 0.1)
+                except Exception:
+                    break
                 for fd in r:
                     try:
-                        data = fd.read(EVENT_SIZE)
-                        if len(data) >= EVENT_SIZE:
-                            _, _, ev_type, ev_code, ev_value = struct.unpack(EVENT_FORMAT, data[:EVENT_SIZE])
-                            # EV_KEY event, KEY_ESC, and press (value == 1)
-                            if ev_type == EV_KEY and ev_code == KEY_ESC and ev_value == 1:
-                                self.callback()
+                        while True:
+                            data = os.read(fd, EVENT_SIZE * 16)
+                            if not data:
+                                break
+                            # Parse all 24-byte event structs in chunk
+                            for offset in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
+                                chunk = data[offset:offset + EVENT_SIZE]
+                                _, _, ev_type, ev_code, ev_value = struct.unpack(EVENT_FORMAT, chunk)
+                                # EV_KEY event, KEY_ESC, and press (value == 1 or 2)
+                                if ev_type == EV_KEY and ev_code == KEY_ESC and ev_value in (1, 2):
+                                    self.callback()
+                    except BlockingIOError:
+                        pass
                     except Exception:
                         pass
         finally:
-            for fd in device_files:
+            for fd in device_fds:
                 try:
-                    fd.close()
+                    os.close(fd)
                 except Exception:
                     pass
 
@@ -612,32 +622,13 @@ class AutoTyperApp:
                     # Standard fast batch / configured speed typing
                     if self.selected_os == "Linux":
                         try:
-                            cmd = None
-                            if self.tool == "wtype":
-                                cmd = ["wtype", "-d", str(base_delay_ms), "-"]
-                            elif self.tool == "xdotool":
-                                cmd = ["xdotool", "type", "--delay", str(base_delay_ms), "--clearmodifiers", "--file", "-"]
-                            
-                            if cmd:
-                                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                                with self.subprocess_lock:
-                                    self.current_subprocess = p
-                                p.stdin.write(content_to_type.encode('utf-8'))
-                                p.stdin.close()
-                                # Wait for completion while polling stop_event for sub-millisecond abort
-                                while p.poll() is None:
-                                    if self.stop_event.is_set():
-                                        try:
-                                            p.terminate()
-                                            p.kill()
-                                        except Exception:
-                                            pass
-                                        break
-                                    time.sleep(0.01)
-                                with self.subprocess_lock:
-                                    self.current_subprocess = None
-                            elif HAS_PYNPUT:
-                                self._type_via_pynput(content_to_type, base_delay_ms)
+                            delay_sec = base_delay_ms / 1000.0
+                            for char in content_to_type:
+                                if self.stop_event.is_set():
+                                    break
+                                self._send_single_char(char)
+                                if delay_sec > 0 and not self.sleep_interruptible(delay_sec):
+                                    break
                         except Exception as e: 
                             print(f"Typing Error: {e}")
                     elif HAS_PYNPUT:
