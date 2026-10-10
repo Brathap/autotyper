@@ -168,41 +168,14 @@ class UniversalGlobalInputListener:
                 time.sleep(0.3)  # Debounce
             time.sleep(0.015)
 
-    def _get_hyprctl_cursor(self):
-        try:
-            out = subprocess.check_output(['hyprctl', 'cursorpos'], stderr=subprocess.DEVNULL).decode()
-            parts = [p.strip() for p in out.strip().split(',')]
-            if len(parts) == 2:
-                return int(parts[0]), int(parts[1])
-        except Exception:
-            pass
-        return None
-
-    def _is_pointer_over_app(self):
-        """Ultra-fast check using cached window bounding box, 100% thread-safe."""
-        if not self.app or not hasattr(self.app, 'window_bbox'):
-            return False
-        bbox = self.app.window_bbox
-        if not bbox:
-            return False
-        rx, ry, rw, rh = bbox
-        cur = self._get_hyprctl_cursor()
-        if cur:
-            cx, cy = cur
-            if rx <= cx <= rx + rw and ry <= cy <= ry + rh:
-                return True
-        return False
-
     def _linux_evdev_loop(self):
-        """Reads raw evdev packets for KEY_ESC (code 1) and pointer clicks across hardware input devices."""
+        """Reads raw evdev packets for KEY_ESC (code 1) across hardware input devices."""
         import glob
         import select
         import struct
         import os
 
         KEY_ESC = 1
-        BTN_LEFT = 0x110
-        BTN_TOUCH = 0x14a
         EV_KEY = 1
         EVENT_SIZE = 24
         EVENT_FORMAT = 'qqHHi'
@@ -236,11 +209,6 @@ class UniversalGlobalInputListener:
                                 if ev_type == EV_KEY and ev_value in (1, 2):
                                     if ev_code == KEY_ESC:
                                         self.esc_callback()
-                                    elif ev_code in (BTN_LEFT, BTN_TOUCH) and self.app and self.app.is_active:
-                                        # Only trigger if active and at least 0.5s after clicking start (debounce initial click)
-                                        if time.time() - getattr(self.app, 'start_time', 0) > 0.5:
-                                            if self._is_pointer_over_app():
-                                                self.esc_callback()
                     except BlockingIOError:
                         pass
                     except Exception:
