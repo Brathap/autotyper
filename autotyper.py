@@ -179,33 +179,18 @@ class UniversalGlobalInputListener:
         return None
 
     def _is_pointer_over_app(self):
-        """Ultra-fast, microsecond cursor check without blocking subprocess calls."""
-        if not self.app:
+        """Ultra-fast check using cached window bounding box, 100% thread-safe."""
+        if not self.app or not hasattr(self.app, 'window_bbox'):
             return False
-        try:
-            # Tkinter's internal XQueryPointer / XWayland root query is instantaneous (~0.2ms)
-            px, py = self.app.root.winfo_pointerxy()
-            rx = self.app.root.winfo_rootx()
-            ry = self.app.root.winfo_rooty()
-            rw = self.app.root.winfo_width()
-            rh = self.app.root.winfo_height()
-            if rx <= px <= rx + rw and ry <= py <= ry + rh:
-                return True
-        except Exception:
-            pass
-        # Fallback to hyprctl cursorpos only if pointerxy returns off-screen
+        bbox = self.app.window_bbox
+        if not bbox:
+            return False
+        rx, ry, rw, rh = bbox
         cur = self._get_hyprctl_cursor()
         if cur:
             cx, cy = cur
-            try:
-                rx = self.app.root.winfo_rootx()
-                ry = self.app.root.winfo_rooty()
-                rw = self.app.root.winfo_width()
-                rh = self.app.root.winfo_height()
-                if rx <= cx <= rx + rw and ry <= cy <= ry + rh:
-                    return True
-            except Exception:
-                pass
+            if rx <= cx <= rx + rw and ry <= cy <= ry + rh:
+                return True
         return False
 
     def _linux_evdev_loop(self):
@@ -323,21 +308,30 @@ class AutoTyperApp:
         self.is_active = False
         self.current_subprocess = None
         self.subprocess_lock = threading.Lock()
+        self.window_bbox = None
 
         # Universal Global hotkey and mouse click listener for instant emergency abort across all apps
         self.esc_listener = UniversalGlobalInputListener(self.stop_process, app=self)
 
         # Local window bindings
         self.root.bind("<Escape>", lambda e: self.stop_process())
+        self.root.bind("<Configure>", self._update_window_bbox)
         self.root.bind_all("<ButtonPress-1>", self._handle_window_click)
         self.root.bind_all("<ButtonRelease-1>", self._handle_window_click)
 
         self.setup_ui()
         self.set_os(self.selected_os)
+        self.root.after(50, self._update_window_bbox)
 
         # On Hyprland / Wayland, configure window as floating and pinned so it's always accessible
         if is_wayland and shutil.which("hyprctl"):
             self.root.after(200, self._ensure_hyprland_floating)
+
+    def _update_window_bbox(self, event=None):
+        try:
+            self.window_bbox = (self.root.winfo_rootx(), self.root.winfo_rooty(), self.root.winfo_width(), self.root.winfo_height())
+        except Exception:
+            pass
 
     def _ensure_hyprland_floating(self):
         try:
