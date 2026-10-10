@@ -9,6 +9,7 @@ import math
 import platform
 import queue
 import ctypes
+import random
 
 # --- CHECK FOR OPTIONAL SPEECH LIBRARY ---
 try:
@@ -31,6 +32,7 @@ THEME = {
     "bg_card": "#2b2b2b",
     "accent": "#4da6ff",
     "success": "#00d26a",
+    "stealth": "#bd93f9",
     "danger": "#ff4d4d",
     "text_main": "#ffffff",
     "text_sub": "#aaaaaa",
@@ -126,7 +128,7 @@ class AutoTyperApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Typer")
-        self.root.geometry("300x560") 
+        self.root.geometry("300x600") 
         self.root.configure(bg=THEME["bg_app"])
         self.root.attributes('-topmost', True)
 
@@ -249,16 +251,20 @@ class AutoTyperApp:
         
         self.btn_start = tk.Button(self.root, text="START TYPING", bg=THEME["success"], fg="#111",
                                    font=FONT_BTN, command=self.start_process, relief="flat", width=BTN_WIDTH, cursor="hand2")
-        self.btn_start.pack(pady=6)
+        self.btn_start.pack(pady=5)
+
+        self.btn_stealth = tk.Button(self.root, text="🛡️ STEALTH (HUMANIZED)", bg=THEME["stealth"], fg="#111",
+                                     font=FONT_BTN, command=self.start_stealth_process, relief="flat", width=BTN_WIDTH, cursor="hand2")
+        self.btn_stealth.pack(pady=5)
 
         txt_speak = "🎤 SPEAK" if HAS_SPEECH else "NO SPEECH LIB"
         self.btn_speak = tk.Button(self.root, text=txt_speak, bg=THEME["accent"], fg="#111",
                                    font=FONT_BTN, command=self.start_speak, relief="flat", width=BTN_WIDTH, cursor="hand2")
         if not HAS_SPEECH: self.btn_speak.config(state="disabled", bg="#333")
-        self.btn_speak.pack(pady=6)
+        self.btn_speak.pack(pady=5)
 
         self.btn_stop = tk.Button(self.root, text="STOP", bg="#333", fg="#666", font=FONT_BTN, command=self.stop_process, relief="flat", width=BTN_WIDTH, state="disabled")
-        self.btn_stop.pack(pady=6)
+        self.btn_stop.pack(pady=5)
 
     # --- OS LOGIC ---
     def set_os(self, os_name):
@@ -292,7 +298,20 @@ class AutoTyperApp:
             self.set_status("CLIPBOARD EMPTY", THEME["danger"])
             return
 
-        self.start_generic(self.run_logic, (text,))
+        self.start_generic(self.run_logic, (text, False))
+
+    def start_stealth_process(self):
+        try: 
+            text = self.root.clipboard_get()
+        except Exception: 
+            self.set_status("CLIPBOARD EMPTY", THEME["danger"])
+            return
+
+        if not text:
+            self.set_status("CLIPBOARD EMPTY", THEME["danger"])
+            return
+
+        self.start_generic(self.run_logic, (text, True))
 
     def start_speak(self):
         if not HAS_SPEECH:
@@ -316,10 +335,12 @@ class AutoTyperApp:
             if is_running:
                 self.btn_stop.config(state="normal", bg=THEME["danger"], fg="white")
                 self.btn_start.config(state="disabled", bg="#333", fg="#555")
+                self.btn_stealth.config(state="disabled", bg="#333", fg="#555")
                 self.btn_speak.config(state="disabled", bg="#333", fg="#555")
             else:
                 self.btn_stop.config(state="disabled", bg="#333", fg="#666")
                 self.btn_start.config(state="normal", bg=THEME["success"], fg="#111")
+                self.btn_stealth.config(state="normal", bg=THEME["stealth"], fg="#111")
                 if HAS_SPEECH: self.btn_speak.config(state="normal", bg=THEME["accent"], fg="#111")
         self.ui_call(_apply)
 
@@ -351,15 +372,19 @@ class AutoTyperApp:
             if not self.stop_event.is_set():
                 self.toggle_ui(False)
 
-    def run_logic(self, text):
+    def run_logic(self, text, is_stealth=False):
         for i in range(5, 0, -1):
             if self.stop_event.is_set(): break
-            self.set_status(f"STARTING IN {i}...", "yellow")
+            status_text = f"STEALTH IN {i}..." if is_stealth else f"STARTING IN {i}..."
+            status_color = THEME["stealth"] if is_stealth else "yellow"
+            self.set_status(status_text, status_color)
             if not self.sleep_interruptible(1.0):
                 break
             
         if not self.stop_event.is_set():
-            self.set_status("TYPING...", THEME["success"])
+            active_status = "TYPING (STEALTH)..." if is_stealth else "TYPING..."
+            active_color = THEME["stealth"] if is_stealth else THEME["success"]
+            self.set_status(active_status, active_color)
             
             if self.selected_os == "Linux":
                 try:
@@ -370,7 +395,7 @@ class AutoTyperApp:
                 except Exception: 
                     pass
             
-            self.type_loop(text)
+            self.type_loop(text, is_stealth=is_stealth)
             if not self.stop_event.is_set():
                 self.set_status("DONE", "white")
         if not self.stop_event.is_set():
@@ -411,8 +436,18 @@ class AutoTyperApp:
         except Exception: 
             pass
 
-    def type_loop(self, text):
-        delay_ms = int(self.speed_scale.get())
+    def _get_keystroke_delay(self, base_delay_ms, is_stealth):
+        if not is_stealth:
+            return base_delay_ms / 1000.0
+        # Humanized random jitter: 40ms to 90ms with Gaussian-like variance
+        jitter_ms = random.uniform(40.0, 90.0)
+        # 4% chance of subtle human micro-pause (pondering/word-transition) between 120ms and 220ms
+        if random.random() < 0.04:
+            jitter_ms += random.uniform(80.0, 150.0)
+        return jitter_ms / 1000.0
+
+    def type_loop(self, text, is_stealth=False):
+        base_delay_ms = int(self.speed_scale.get())
         mode = self.mode_var.get()
 
         # Sanitize smart quotes and non-breaking spaces
@@ -445,7 +480,8 @@ class AutoTyperApp:
                         if self.stop_event.is_set(): 
                             break
                         self.send_key("BackSpace")
-                        if not self.sleep_interruptible(delay_ms / 2000.0):
+                        backspace_delay = self._get_keystroke_delay(base_delay_ms, is_stealth) / 2.0
+                        if not self.sleep_interruptible(backspace_delay):
                             break
 
                 if has_content:
@@ -453,39 +489,49 @@ class AutoTyperApp:
                     last_line_ended_colon = content_to_type.strip().endswith(":")
 
             if content_to_type:
-                if self.selected_os == "Linux":
-                    try:
-                        if self.tool == "wtype":
-                            subprocess.run(["wtype", "-d", str(delay_ms), "-"], input=content_to_type.encode('utf-8'), check=False)
-                        elif self.tool == "xdotool":
-                            subprocess.run(["xdotool", "type", "--delay", str(delay_ms), "--clearmodifiers", "--file", "-"], input=content_to_type.encode('utf-8'), check=False)
-                        elif HAS_PYNPUT:
-                            self._type_via_pynput(content_to_type, delay_ms)
-                    except Exception as e: 
-                        print(f"Typing Error: {e}")
-                elif HAS_PYNPUT:
-                    self._type_via_pynput(content_to_type, delay_ms)
-                elif self.selected_os == "Windows":
-                    # Native Windows typing with ctypes User32 (zero external dependencies)
-                    delay_sec = delay_ms / 1000.0
+                # Per-character typing loop with humanized jitter or native batch
+                if is_stealth:
+                    # Stealth mode: individual humanized keystrokes across all platforms
                     for char in content_to_type:
                         if self.stop_event.is_set():
                             break
-                        NativeKeyboard.win32_send_unicode_char(char)
-                        if delay_sec > 0 and not self.sleep_interruptible(delay_sec):
+                        self._send_single_char(char)
+                        char_delay = self._get_keystroke_delay(base_delay_ms, is_stealth=True)
+                        if not self.sleep_interruptible(char_delay):
                             break
-                elif self.selected_os == "macOS":
-                    # Native macOS typing via AppleScript osascript (zero external dependencies)
-                    delay_sec = delay_ms / 1000.0
-                    if delay_sec > 0.05:
+                else:
+                    # Standard fast batch / configured speed typing
+                    if self.selected_os == "Linux":
+                        try:
+                            if self.tool == "wtype":
+                                subprocess.run(["wtype", "-d", str(base_delay_ms), "-"], input=content_to_type.encode('utf-8'), check=False)
+                            elif self.tool == "xdotool":
+                                subprocess.run(["xdotool", "type", "--delay", str(base_delay_ms), "--clearmodifiers", "--file", "-"], input=content_to_type.encode('utf-8'), check=False)
+                            elif HAS_PYNPUT:
+                                self._type_via_pynput(content_to_type, base_delay_ms)
+                        except Exception as e: 
+                            print(f"Typing Error: {e}")
+                    elif HAS_PYNPUT:
+                        self._type_via_pynput(content_to_type, base_delay_ms)
+                    elif self.selected_os == "Windows":
+                        delay_sec = base_delay_ms / 1000.0
                         for char in content_to_type:
                             if self.stop_event.is_set():
                                 break
-                            NativeKeyboard.mac_send_text(char)
-                            if not self.sleep_interruptible(delay_sec):
+                            NativeKeyboard.win32_send_unicode_char(char)
+                            if delay_sec > 0 and not self.sleep_interruptible(delay_sec):
                                 break
-                    else:
-                        NativeKeyboard.mac_send_text(content_to_type)
+                    elif self.selected_os == "macOS":
+                        delay_sec = base_delay_ms / 1000.0
+                        if delay_sec > 0.05:
+                            for char in content_to_type:
+                                if self.stop_event.is_set():
+                                    break
+                                NativeKeyboard.mac_send_text(char)
+                                if not self.sleep_interruptible(delay_sec):
+                                    break
+                        else:
+                            NativeKeyboard.mac_send_text(content_to_type)
 
             if i < total_lines - 1 and not self.stop_event.is_set():
                 if self.selected_os == "Linux":
@@ -531,6 +577,25 @@ class AutoTyperApp:
                     shift_pressed = (mode == "Smart")
                     NativeKeyboard.mac_send_key("Return", shift=shift_pressed)
                     self.sleep_interruptible(0.1)
+
+    def _send_single_char(self, char):
+        """Sends a single character using the active platform driver (zero-dependency compatible)."""
+        if self.selected_os == "Linux":
+            try:
+                if self.tool == "wtype":
+                    subprocess.run(["wtype", "-"], input=char.encode('utf-8'), check=False)
+                elif self.tool == "xdotool":
+                    subprocess.run(["xdotool", "type", "--clearmodifiers", "--file", "-"], input=char.encode('utf-8'), check=False)
+                elif HAS_PYNPUT:
+                    keyboard.type(char)
+            except Exception:
+                pass
+        elif HAS_PYNPUT:
+            keyboard.type(char)
+        elif self.selected_os == "Windows":
+            NativeKeyboard.win32_send_unicode_char(char)
+        elif self.selected_os == "macOS":
+            NativeKeyboard.mac_send_text(char)
 
     def _type_via_pynput(self, content, delay_ms):
         delay_sec = delay_ms / 1000.0
